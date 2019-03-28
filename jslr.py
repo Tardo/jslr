@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# JS Library Report
+# JS Library Report v0.2.0
 # Copyright 2019 Alexandre Díaz <dev@redneboa.es>
 # License GPL-3.0 or later (https://www.gnu.org/licenses/gpl).
 
@@ -11,30 +11,32 @@ import json
 import difflib
 import filecmp
 import sys
+from multiprocessing import Pool
 
 REPORT_FILENAME = 'report.html'
+MAX_WORKERS = 4
 
 
 def get_lib_name(filename):
-    ms = re.search(r'([a-z-_\s]+[a-z])', filename.lower())
-    return ms and ms[1] or False
+    ms = re.search(r'([a-z-_\s\.]+[a-z])', filename.lower())
+    return ms and ms[1].replace('.js', '') or False
 
 
 def get_lib_version(filepath):
     files = filepath.split('/')
-    ms = re.search(r'[-_](\d+\.\d+\.\d+)', files[-1])
+    ms = re.search(r'[-_](\d{1,2}\.\d{1,2}\.\d{1,3})', files[-1])
     if not ms:
-        ms = re.search(r'[-_](\d+\.\d+)', files[-1])
+        ms = re.search(r'[-_](\d{1,2}\.\d{1,2})', files[-1])
     if not ms:
         with open(filepath) as file:
             for line in file:
-                ms = re.search(r'\s[v\'"]?(\d+\.\d+\.\d+)', line)
+                ms = re.search(r'(?:ver.+[\'"](\d{1,2}\.\d{1,2}\.\d{1,3})|(?:\/\*|\/\/|\*)[^\d]+\sv?(\d{1,2}\.\d{1,2}\.\d{1,3})\s)', line)
                 if ms:
                     break
-                ms = re.search(r'\s[v\'"](\d+\.\d+)', line)
+                ms = re.search(r'(?:ver.+[\'"](\d{1,2}\.\d{1,2})|(?:\/\*|\/\/|\*)[^\d]+\sv?(\d{1,2}\.\d{1,2})\s)', line)
                 if ms:
                     break
-    return ms and ms[1] or False
+    return ms and (ms[1] or ms[2]) or False
 
 
 def get_js_libs(path):
@@ -54,41 +56,125 @@ def get_js_libs(path):
     return js_libs
 
 
-def download_cdnjs(js_libs, to_folder):
-    regex_min = r'[\.\/\-_]min'
-    for jslib in js_libs:
-        r = urllib.request.urlopen('https://api.cdnjs.com/libraries?search=%s&fields=name,filename,version' % jslib['name'])
-        encoding = r.info().get_content_charset('utf-8')
-        JSON_object = json.loads(r.read().decode(encoding))
-        if any(JSON_object) and any(JSON_object['results']):
-            cdnjs_info = JSON_object['results'][0]
-            if cdnjs_info['version'] > jslib['version']:
-                jslib.update({
-                    'outdated': True,
-                    'new_version': cdnjs_info['version'],
-                })
-            cdnjs_url = cdnjs_info['latest']
-            if not re.search(regex_min, jslib['filepath'].split('/')[-1]):
-                cdnjs_url = re.sub(regex_min, '', cdnjs_url)
-            jslib.update({'cdnjs_latest': cdnjs_url})
-            cdnjs_url = cdnjs_url.replace(cdnjs_info['version'],
-                                          jslib['version'])
-            try:
-                urllib.request.urlretrieve(cdnjs_url,
-                                           '%s/%s.js' % (to_folder,
-                                                         jslib['name']))
-            except urllib.error.HTTPError:
-                print("!", end='', flush=True)
-                pass
-            else:
-                jslib.update({'cdnjs': cdnjs_url})
-                print(".", end='', flush=True)
-    print(" ")
+def download_cdnjs(index, jslib, to_folder):
+    r = urllib.request.urlopen('https://api.cdnjs.com/libraries?search=%s&fields=name,filename,version,homepage,license' % jslib['name'])
+    encoding = r.info().get_content_charset('utf-8')
+    JSON_object = json.loads(r.read().decode(encoding))
+    if any(JSON_object) and any(JSON_object['results']):
+        cdnjs_info = JSON_object['results'][0]
+        smatch = difflib.SequenceMatcher(
+            None,
+            get_lib_name(cdnjs_info['name']) or '',
+            jslib['name'] or '')
+        if not smatch or smatch.quick_ratio() < 0.9:
+            print("!", end='', flush=True)
+            return False
+        result = {}
+        if cdnjs_info['version'] > jslib['version']:
+            result.update({'new_version': cdnjs_info['version']})
+        cdnjs_url = cdnjs_info['latest']
+        if not re.search(r'[\.\/\-_]min', jslib['filepath'].split('/')[-1]):
+            cdnjs_url = re.sub(r'[\.\/\-_]min', '', cdnjs_url)
+        result.update({
+            'cdnjs_latest': cdnjs_url,
+            'homepage': cdnjs_info['homepage'],
+            'license': cdnjs_info['license'],
+        })
+        cdnjs_url = cdnjs_url.replace(cdnjs_info['version'],
+                                      jslib['version'])
+        try:
+            urllib.request.urlretrieve(cdnjs_url,
+                                       '%s/%s.js' % (to_folder, jslib['name']))
+        except urllib.error.HTTPError:
+            print("!", end='', flush=True)
+        else:
+            result.update({'cdnjs': cdnjs_url})
+            print(".", end="", flush=True)
+            return {
+                'id': index,
+                'result': result,
+            }
+    return False
+
+
+def generate_jslib_html_section(jslib, orig_folder):
+    if 'new_version' in jslib:
+        adv_class = 'warn'
+        last_version = '%s <b>NEW VERSION!</b> <a href="%s">Download</a>' % (
+            jslib['new_version'], jslib['cdnjs_latest'])
+    else:
+        adv_class = ''
+        last_version = jslib['version']
+    tofile = jslib['filepath']
+    fromfile = os.path.join(orig_folder, '%s.js' % jslib['name'])
+    if filecmp.cmp(fromfile, tofile):
+        match_result = "OK"
+        diff_html = ''
+    else:
+        try:
+            with open(fromfile) as tfile:
+                fromlines = tfile.readlines()
+            with open(tofile) as tfile:
+                tolines = tfile.readlines()
+        except UnicodeDecodeError:
+            return '''
+                <div class='js_lib err'>
+                    <div class='title'>%s <span class='version'>%s</span></div>
+                    <div class='last_version'>Lastest Version: %s</div>
+                    <div class='homepage'>Homepage: <a href='%s'>%s</a></div>
+                    <div class='license'>License: %s</div>
+                    <div class='cdnjs'>CDNjs: <a href='%s'>%s</a></div>
+                    <div class='hashes'>Files Comparison: ERROR</div>
+                    <div class='failure'>Can't read file. Unsupported enconding!</div>
+                </div>
+            ''' % (
+                jslib['filepath'], jslib['version'],
+                last_version,
+                jslib['homepage'], jslib['homepage'],
+                jslib['license'],
+                jslib['cdnjs'], jslib['cdnjs'],
+            )
+        adv_class = 'err'
+        match_result = "<span class='failure'>FAIL</span>"
+        diff_gen = difflib.HtmlDiff()
+        diff_gen._legend = ""
+        diff_html = diff_gen.make_table(
+            fromlines, tolines, fromfile, tofile, True, 3)
+    print(".", end='', flush=True)
+    return '''
+        <div class='js_lib %s'>
+            <div class='title'>%s <span class='version'>%s</span></div>
+            <div class='last_version'>Lastest Version: %s</div>
+            <div class='homepage'>Homepage: <a href='%s'>%s</a></div>
+            <div class='license'>License: %s</div>
+            <div class='cdnjs'>CDNjs: <a href='%s'>%s</a></div>
+            <div class='hashes'>Files Comparison: %s</div>
+            <div class='detail'>%s</div>
+        </div>
+    ''' % (
+        adv_class,
+        jslib['filepath'], jslib['version'],
+        last_version,
+        jslib['homepage'], jslib['homepage'],
+        jslib['license'],
+        jslib['cdnjs'], jslib['cdnjs'],
+        match_result,
+        diff_html,
+    )
 
 
 def check_jslibs_integrity(js_libs, orig_folder):
-    download_cdnjs(js_libs, orig_folder)
+    pool = Pool(processes=MAX_WORKERS)
 
+    # Download JS from CDNjs
+    args = [(k, v, orig_folder) for k, v in enumerate(js_libs)]
+    result = pool.starmap(download_cdnjs, args)
+    for r in result:
+        if r:
+            js_libs[r['id']].update(r['result'])
+    print(" ")
+
+    # Generate HTML
     with open(REPORT_FILENAME, 'w') as file:
         html_str = '''
             <!DOCTYPE html>
@@ -119,6 +205,7 @@ def check_jslibs_integrity(js_libs, orig_folder):
                         .js_lib > .detail {
                             max-height: 150px;
                             overflow: auto;
+                            background-color: white;
                         }
 
                         .js_lib.warn > .last_version, .js_lib.noversion {
@@ -131,52 +218,17 @@ def check_jslibs_integrity(js_libs, orig_folder):
                         table.diff {
                             width: 100%%;
                         }
+
+                        %s
                     </style>
                 </head>
                 <body>
                     <h1>JS Libraries Report (%d Founded)</h1>
-        ''' % len(js_libs)
+        ''' % (difflib.HtmlDiff()._styles, len(js_libs))
+        args = []
         for jslib in js_libs:
             if 'cdnjs' in jslib:
-                if 'outdated' in jslib:
-                    adv_class = 'warn'
-                    last_version = '%s <b>NEW VERSION!</b> <a href="%s">Download</a>' % (jslib['new_version'], jslib['cdnjs_latest'])
-                else:
-                    adv_class = ''
-                    last_version = jslib['version']
-                tofile = jslib['filepath']
-                fromfile = os.path.join(orig_folder, '%s.js' % jslib['name'])
-                if filecmp.cmp(fromfile, tofile):
-                    match_result = "OK"
-                    diff_html = ''
-                else:
-                    with open(fromfile) as tfile:
-                        fromlines = tfile.readlines()
-                    with open(tofile) as tfile:
-                        tolines = tfile.readlines()
-                    adv_class = 'err'
-                    match_result = "<span class='failure'>FAIL</span>"
-                    diff_gen = diff_html = difflib.HtmlDiff()
-                    diff_gen._legend = ""
-                    diff_html = diff_gen.make_file(
-                        fromlines, tolines, fromfile, tofile, True, 3)
-                html_str += '''
-                    <div class='js_lib %s'>
-                        <div class='title'>%s <span class='version'>%s</span></div>
-                        <div class='last_version'>Lastest Version: %s</div>
-                        <div class='cdnjs'>CDNjs: <a href='%s'>%s</a></div>
-                        <div class='hashes'>Files Comparison: %s</div>
-                        <div class='detail'>%s</div>
-                    </div>
-                ''' % (
-                    adv_class,
-                    jslib['filepath'], jslib['version'],
-                    last_version,
-                    jslib['cdnjs'], jslib['cdnjs'],
-                    match_result,
-                    diff_html,
-                )
-                print(".", end='', flush=True)
+                args.append((jslib, orig_folder))
             else:
                 html_str += '''
                     <div class='js_lib noversion'>
@@ -185,6 +237,8 @@ def check_jslibs_integrity(js_libs, orig_folder):
                     </div>
                 ''' % (jslib['filepath'], jslib['version'])
                 print("!", end='', flush=True)
+        result = pool.starmap(generate_jslib_html_section, args)
+        html_str += '\n'.join(result)
         html_str += '''
                 </body>
             </html>
